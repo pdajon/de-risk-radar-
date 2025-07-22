@@ -1,0 +1,93 @@
+name: De‑Risk Radar
+
+on:
+  schedule:                          # runs twice a day (7 AM / 7 PM Chicago time)
+    - cron:  '0 12 * * *'            # 12 UTC  ➜ 07:00 AM CT
+    - cron:  '0 0  * * *'            # 00 UTC  ➜ 07:00 PM CT
+  workflow_dispatch:                 # lets you trigger it manually
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo (empty)
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install deps
+        run: pip install pandas requests jinja2
+
+      - name: Run report script
+        run: |
+          python - <<'PY'
+          import requests, pandas as pd, datetime as dt, json, textwrap, os, math
+
+          # -------- 1. PULL PUBLIC DATA  --------
+          def cg_simple(ids):
+              url = "https://api.coingecko.com/api/v3/simple/price"
+              r = requests.get(url, params={"ids": ids, "vs_currencies": "usd"})
+              return r.json()[ids]["usd"]
+          btc    = cg_simple("bitcoin")
+          urlcap = "https://api.coingecko.com/api/v3/global"
+          mcap   = requests.get(urlcap).json()["data"]["total_market_cap"]["usd"]
+
+          # Binance funding & OI
+          bin_base = "https://fapi.binance.com/fapi/v1"
+          funding  = requests.get(f"{bin_base}/fundingRate", params={"symbol":"BTCUSDT","limit":1}).json()[0]
+          lastFunding = float(funding["fundingRate"])*100
+          oi_data = requests.get(f"{bin_base}/openInterestHist",
+                     params={"symbol":"BTCUSDT","period":"1d","limit":2}).json()
+          open_interest = float(oi_data[-1]["sumOpenInterest"])/1e6  # in M USD
+
+          # Fear & Greed
+          fear = int(requests.get("https://api.alternative.me/fng/?limit=1").json()["data"][0]["value"])
+
+          # -------- 2. PI‑CYCLE TOP (111 SMA vs 2×350 SMA) --------
+          hist = requests.get("https://api.coingecko.com/api/v3/coins/bitcoin/market_chart",
+                              params={"vs_currency":"usd","days":"400"}).json()["prices"]
+          df = pd.DataFrame(hist, columns=["ts","price"])
+          df["price"] = df["price"].astype(float)
+          df["sma111"] = df["price"].rolling(111).mean()
+          df["sma350"] = df["price"].rolling(350).mean()*2
+          latest = df.iloc[-1]
+          pi_cross = latest["sma111"] > latest["sma350"]
+
+          # -------- 3. SIMPLE RISK FLAGS --------
+          risk_flags = []
+          if pi_cross: risk_flags.append("⚠️ Pi‑Cycle Top flash")
+          if fear > 80: risk_flags.append("😬 Fear‑&‑Greed ≥ 80 (extreme greed)")
+          if lastFunding > 0.1: risk_flags.append(f"📈 Funding {lastFunding:.2f}% (elevated)")
+          if btc > 0.04*mcap: risk_flags.append("🔥 BTC dominance high vs total cap")
+
+          # -------- 4. BUILD SUMMARY STRING --------
+          d = dt.datetime.utcnow().strftime('%Y‑%m‑%d %H:%M UTC')
+          summary = textwrap.dedent(f"""
+          **De‑Risk Radar — {d}**
+
+          • BTC price : ${btc:,.0f}
+          • Crypto mkt cap : ${mcap/1e12:.2f} T
+          • 8h funding : {lastFunding:.2f} %
+          • Open interest : ${open_interest:,.0f} M
+          • Fear & Greed : {fear}/100
+          • Pi‑Cycle cross ? {'YES' if pi_cross else 'no'}
+
+          {"**Risk alerts:** " + ", ".join(risk_flags) if risk_flags else "No major red flags."}
+          """)
+
+          # -------- 5. SAVE ARTIFACT --------
+          out = "radar.md"
+          with open(out, "w") as f:
+              f.write(summary)
+
+          print(summary)
+          PY
+
+      - name: Upload summary for this run (optional)
+        uses: actions/upload-artifact@v4
+        with:
+          name: de-risk-radar
+          path: radar.md
